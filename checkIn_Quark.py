@@ -1,7 +1,7 @@
 import os
 import re
 import sys
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, unquote
 
 import requests
 
@@ -24,10 +24,16 @@ def parse_accounts(raw):
                 item[key.strip()] = value.strip()
         # New format: user=...; url=https://...?...&kps=...&sign=...&vcode=...
         if item.get("url"):
-            query = parse_qs(urlparse(item["url"]).query)
+            # unquote() deliberately preserves literal '+' characters; parse_qs()
+            # would turn '+' into a space and can corrupt newer Quark credentials.
+            query = {}
+            for pair in urlparse(item["url"]).query.split("&"):
+                if "=" in pair:
+                    key, value = pair.split("=", 1)
+                    query[unquote(key)] = unquote(value)
             for key in ("kps", "sign", "vcode"):
                 if not item.get(key) and query.get(key):
-                    item[key] = query[key][0]
+                    item[key] = query[key]
         if not all(item.get(key) for key in ("kps", "sign", "vcode")):
             raise ValueError(
                 "账号配置缺少 kps/sign/vcode；请检查 COOKIE_QUARK，或重新抓取完整签到 URL。"
