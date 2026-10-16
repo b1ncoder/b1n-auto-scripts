@@ -1,189 +1,135 @@
-import os 
-import re 
-import sys 
-import requests 
+import os
+import re
+import sys
+from urllib.parse import urlparse, parse_qs
 
-cookie_list = os.getenv("COOKIE_QUARK").split('\n|&&')
+import requests
 
-# 替代 notify 功能
-def send(title, message):
-    print(f"{title}: {message}")
+INFO_URL = "https://drive-m.quark.cn/1/clouddrive/capacity/growth/info"
+SIGN_URL = "https://drive-m.quark.cn/1/clouddrive/capacity/growth/sign"
+TIMEOUT = 20
 
-# 获取环境变量 
-def get_env(): 
-    # 判断 COOKIE_QUARK是否存在于环境变量 
-    if "COOKIE_QUARK" in os.environ: 
-        # 读取系统变量以 \n 或 && 分割变量 
-        cookie_list = re.split('\n|&&', os.environ.get('COOKIE_QUARK')) 
-    else: 
-        # 标准日志输出 
-        print('❌未添加COOKIE_QUARK变量') 
-        send('夸克自动签到', '❌未添加COOKIE_QUARK变量') 
-        # 脚本退出 
-        sys.exit(0) 
 
-    return cookie_list 
+def parse_accounts(raw):
+    accounts = []
+    for block in re.split(r"\n|&&", raw or ""):
+        block = block.strip()
+        if not block:
+            continue
+        item = {}
+        for part in block.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, value = part.split("=", 1)
+                item[key.strip()] = value.strip()
+        # New format: user=...; url=https://...?...&kps=...&sign=...&vcode=...
+        if item.get("url"):
+            query = parse_qs(urlparse(item["url"]).query)
+            for key in ("kps", "sign", "vcode"):
+                if not item.get(key) and query.get(key):
+                    item[key] = query[key][0]
+        if not all(item.get(key) for key in ("kps", "sign", "vcode")):
+            raise ValueError(
+                "账号配置缺少 kps/sign/vcode；请检查 COOKIE_QUARK，或重新抓取完整签到 URL。"
+            )
+        accounts.append(item)
+    if not accounts:
+        raise ValueError("未读取到账号，请检查 GitHub Secret COOKIE_QUARK。")
+    return accounts
 
-# 其他代码...
 
-class Quark:
-    '''
-    Quark类封装了签到、领取签到奖励的方法
-    '''
-    def __init__(self, user_data):
-        '''
-        初始化方法
-        :param user_data: 用户信息，用于后续的请求
-        '''
-        self.param = user_data
+def request_json(method, url, **kwargs):
+    response = requests.request(method, url, timeout=TIMEOUT, **kwargs)
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"接口返回的不是有效 JSON（HTTP {response.status_code}）") from exc
+    return data
 
-    def convert_bytes(self, b):
-        '''
-        将字节转换为 MB GB TB
-        :param b: 字节数
-        :return: 返回 MB GB TB
-        '''
-        units = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-        i = 0
-        while b >= 1024 and i < len(units) - 1:
-            b /= 1024
-            i += 1
-        return f"{b:.2f} {units[i]}"
 
-    def get_growth_info(self):
-        '''
-        获取用户当前的签到信息
-        :return: 返回一个字典，包含用户当前的签到信息
-        '''
-        url = "https://drive-m.quark.cn/1/clouddrive/capacity/growth/info"
-        querystring = {
-            "pr": "ucpro",
-            "fr": "android",
-            "kps": self.param.get('kps'),
-            "sign": self.param.get('sign'),
-            "vcode": self.param.get('vcode')
-        }
-        response = requests.get(url=url, params=querystring).json()
-        #print(response)
-        if response.get("data"):
-            return response["data"]
-        else:
-            return False
+def params_for(account):
+    return {
+        "pr": "ucpro",
+        "fr": "android",
+        "kps": account["kps"],
+        "sign": account["sign"],
+        "vcode": account["vcode"],
+    }
 
-    def get_growth_sign(self):
-        '''
-        获取用户当前的签到信息
-        :return: 返回一个字典，包含用户当前的签到信息
-        '''
-        url = "https://drive-m.quark.cn/1/clouddrive/capacity/growth/sign"
-        querystring = {
-            "pr": "ucpro",
-            "fr": "android",
-            "kps": self.param.get('kps'),
-            "sign": self.param.get('sign'),
-            "vcode": self.param.get('vcode')
-        }
-        data = {"sign_cyclic": True}
-        response = requests.post(url=url, json=data, params=querystring).json()
-        #print(response)
-        if response.get("data"):
-            return True, response["data"]["sign_daily_reward"]
-        else:
-            return False, response["message"]
 
-    def queryBalance(self):
-        '''
-        查询抽奖余额
-        '''
-        url = "https://coral2.quark.cn/currency/v1/queryBalance"
-        querystring = {
-            "moduleCode": "1f3563d38896438db994f118d4ff53cb",
-            "kps": self.param.get('kps'),
-        }
-        response = requests.get(url=url, params=querystring).json()
-        # print(response)
-        if response.get("data"):
-            return response["data"]["balance"]
-        else:
-            return response["msg"]
+def format_bytes(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if value < 1024 or unit == "PB":
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PB"
 
-    def do_sign(self):
-        '''
-        执行签到任务
-        :return: 返回一个字符串，包含签到结果
-        '''
-        log = ""
-        # 每日领空间
-        growth_info = self.get_growth_info()
-        if growth_info:
-            log += (
-                f" {'88VIP' if growth_info['88VIP'] else '普通用户'} {self.param.get('user')}\n"
-                f"💾 网盘总容量：{self.convert_bytes(growth_info['total_capacity'])}，"
-                f"签到累计容量：")
-            if "sign_reward" in growth_info['cap_composition']:
-                log += f"{self.convert_bytes(growth_info['cap_composition']['sign_reward'])}\n"
-            else:
-                log += "0 MB\n"
-            if growth_info["cap_sign"]["sign_daily"]:
-                log += (
-                    f"✅ 签到日志: 今日已签到+{self.convert_bytes(growth_info['cap_sign']['sign_daily_reward'])}，"
-                    f"连签进度({growth_info['cap_sign']['sign_progress']}/{growth_info['cap_sign']['sign_target']})\n"
-                )
-            else:
-                sign, sign_return = self.get_growth_sign()
-                if sign:
-                    log += (
-                        f"✅ 执行签到: 今日签到+{self.convert_bytes(sign_return)}，"
-                        f"连签进度({growth_info['cap_sign']['sign_progress'] + 1}/{growth_info['cap_sign']['sign_target']})\n"
-                    )
-                else:
-                    log += f"❌ 签到异常: {sign_return}\n"
-        else:
-            # log += f"❌ 签到异常: 获取成长信息失败\n"
-            raise Exception("❌ 签到异常: 获取成长信息失败")  # 适用于单账号情形，当 cookie 值失效后直接报错，方便通过 github action 的操作系统来进行提醒 如果你使用的是多账号签到的话，不要跟进此更新
 
-        return log
+def sign_account(account, index):
+    user = account.get("user") or f"账号 {index}"
+    params = params_for(account)
+    info = request_json("GET", INFO_URL, params=params)
+    growth = info.get("data")
+    if not growth:
+        raise RuntimeError(f"获取成长信息失败：{info.get('message') or info.get('msg') or '接口未返回 data'}")
+
+    vip = "88VIP" if growth.get("88VIP") else "普通用户"
+    cap_sign = growth.get("cap_sign") or {}
+    total = format_bytes(growth.get("total_capacity", 0))
+    lines = [f"{vip} {user}", f"网盘总容量：{total}"]
+
+    if cap_sign.get("sign_daily"):
+        reward = cap_sign.get("sign_daily_reward", 0)
+        lines.append(f"已签到：今日奖励 {format_bytes(reward)}")
+        return "\n".join(lines)
+
+    result = request_json(
+        "POST",
+        SIGN_URL,
+        params=params,
+        json={"sign_cyclic": True},
+    )
+    data = result.get("data")
+    if not data:
+        raise RuntimeError(f"签到失败：{result.get('message') or result.get('msg') or '接口未返回 data'}")
+
+    reward = data.get("sign_daily_reward", 0)
+    lines.append(f"签到成功：今日奖励 {format_bytes(reward)}")
+    return "\n".join(lines)
 
 
 def main():
-    '''
-    主函数
-    :return: 返回一个字符串，包含签到结果
-    '''
-    msg = ""
-    global cookie_quark
-    cookie_quark = get_env()
-
-    print("✅ 检测到共", len(cookie_quark), "个夸克账号\n")
-
-    i = 0
-    while i < len(cookie_quark):
-        # 获取user_data参数
-        user_data = {}  # 用户信息
-        for a in cookie_quark[i].replace(" ", "").split(';'):
-            if not a == '':
-                user_data.update({a[0:a.index('=')]: a[a.index('=') + 1:]})
-        # print(user_data)
-        # 开始任务
-        log = f"🙍🏻‍♂️ 第{i + 1}个账号"
-        msg += log
-        # 登录
-        log = Quark(user_data).do_sign()
-        msg += log + "\n"
-
-        i += 1
-
-    # print(msg)
+    raw = os.environ.get("COOKIE_QUARK", "")
+    if not raw.strip():
+        print("❌ 未设置 GitHub Secret COOKIE_QUARK")
+        return 2
 
     try:
-        send('夸克自动签到', msg)
-    except Exception as err:
-        print('%s\n❌ 错误，请查看运行日志！' % err)
+        accounts = parse_accounts(raw)
+    except Exception as exc:
+        print(f"❌ 配置错误：{exc}")
+        return 2
 
-    return msg[:-1]
+    print(f"检测到 {len(accounts)} 个夸克账号")
+    failures = 0
+    for index, account in enumerate(accounts, start=1):
+        try:
+            print(f"\n[{index}/{len(accounts)}] {sign_account(account, index)}")
+        except Exception as exc:
+            failures += 1
+            print(f"\n❌ 第 {index} 个账号（{account.get('user') or '未命名'}）失败：{exc}")
+
+    if failures:
+        print(f"\n签到结束：{failures} 个账号失败。请检查凭证或接口状态。")
+        return 1
+    print("\n签到结束：所有账号均已签到或签到成功。")
+    return 0
 
 
 if __name__ == "__main__":
-    print("----------夸克网盘开始签到----------")
-    main()
-    print("----------夸克网盘签到完毕----------")
+    sys.exit(main())
